@@ -6,8 +6,8 @@
 
 import * as vscode from 'vscode';
 import * as util from '../common';
-import * as cpptools from './client';
 import * as telemetry from '../telemetry';
+import * as cpptools from './client';
 import { getCustomConfigProviders } from './customProviders';
 import { TimeTelemetryCollector } from './timeTelemetryCollector';
 
@@ -43,7 +43,7 @@ export class ClientCollection {
         if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
             let isFirstWorkspaceFolder: boolean = true;
             vscode.workspace.workspaceFolders.forEach(folder => {
-                const newClient: cpptools.Client = cpptools.createClient(this, folder);
+                const newClient: cpptools.Client = cpptools.createClient(folder);
                 this.languageClients.set(util.asFolder(folder.uri), newClient);
                 if (isFirstWorkspaceFolder) {
                     isFirstWorkspaceFolder = false;
@@ -58,21 +58,21 @@ export class ClientCollection {
             }
             this.activeClient = client;
         } else {
-            this.activeClient = cpptools.createClient(this);
+            this.activeClient = cpptools.createClient();
         }
         this.defaultClient = this.activeClient;
         this.languageClients.set(key, this.activeClient);
 
         this.disposables.push(vscode.workspace.onDidChangeWorkspaceFolders(e => this.onDidChangeWorkspaceFolders(e)));
-        this.disposables.push(vscode.workspace.onDidCloseTextDocument(d => this.onDidCloseTextDocument(d)));
     }
 
-    public async activeDocumentChanged(document: vscode.TextDocument): Promise<void> {
-        this.activeDocument = document;
-        const activeClient: cpptools.Client = this.getClientFor(document.uri);
+    public async didChangeActiveEditor(editor?: vscode.TextEditor): Promise<void> {
+        this.activeDocument = editor?.document;
 
         // Notify the active client that the document has changed.
-        await activeClient.activeDocumentChanged(document);
+        // If there is no active document, switch to the default client.
+        const activeClient: cpptools.Client = !editor ? this.defaultClient : this.getClientFor(editor.document.uri);
+        await activeClient.didChangeActiveEditor(editor);
 
         // If the active client changed, resume the new client and tell the currently active client to deactivate.
         if (activeClient !== this.activeClient) {
@@ -101,7 +101,7 @@ export class ClientCollection {
 
     public checkOwnership(client: cpptools.Client, document: vscode.TextDocument): boolean {
 
-        return (this.getClientFor(document.uri) === client);
+        return this.getClientFor(document.uri) === client;
     }
 
     /**
@@ -121,7 +121,10 @@ export class ClientCollection {
             const client: cpptools.Client = pair[1];
 
             const newClient: cpptools.Client = this.createClient(client.RootFolder, true);
-            client.TrackedDocuments.forEach(document => this.transferOwnership(document, client));
+            for (const document of client.TrackedDocuments.values()) {
+                this.transferOwnership(document, client);
+                await newClient.sendDidOpen(document);
+            }
 
             if (this.activeClient === client) {
                 // It cannot be undefined. If there is an active document, we activate it later.
@@ -137,9 +140,12 @@ export class ClientCollection {
 
         if (this.activeDocument) {
             this.activeClient = this.getClientFor(this.activeDocument.uri);
-            await this.activeClient.activeDocumentChanged(this.activeDocument);
+            this.activeClient.updateActiveDocumentTextOptions();
             this.activeClient.activate();
+            await this.activeClient.didChangeActiveEditor(vscode.window.activeTextEditor);
         }
+        const cppEditors: vscode.TextEditor[] = vscode.window.visibleTextEditors.filter(e => util.isCpp(e.document));
+        await this.defaultClient.onDidChangeVisibleTextEditors(cppEditors);
     }
 
     private async onDidChangeWorkspaceFolders(e?: vscode.WorkspaceFoldersChangeEvent): Promise<void> {
@@ -149,89 +155,45 @@ export class ClientCollection {
         }
 
         if (e !== undefined) {
-            let oldDefaultClient: cpptools.Client | undefined;
-            let needNewDefaultClient: boolean = false;
 
             e.removed.forEach(folder => {
                 const path: string = util.asFolder(folder.uri);
                 const client: cpptools.Client | undefined = this.languageClients.get(path);
                 if (client) {
-                    this.languageClients.delete(path);  // Do this first so that we don't iterate on it during the ownership transfer process.
+                    this.languageClients.delete(path); // Do this first so that we don't iterate on it during the ownership transfer process.
 
                     // Transfer ownership of the client's documents to another client.
-                    // (this includes calling textDocument/didOpen on the new client so that the server knows it's open too)
                     client.TrackedDocuments.forEach(document => this.transferOwnership(document, client));
 
                     if (this.activeClient === client) {
                         this.activeClient.deactivate();
                     }
 
-                    // Defer selecting a new default client until all adds and removes have been processed.
-                    if (this.defaultClient === client) {
-                        oldDefaultClient = client;
-                    } else {
-                        client.dispose();
-                    }
+                    client.dispose();
                 }
             });
 
-            e.added.forEach(folder => {
-                const path: string = util.asFolder(folder.uri);
-                const client: cpptools.Client | undefined = this.languageClients.get(path);
-                if (!client) {
-                    this.createClient(folder, true);
-                }
-            });
-
-            // Note: VS Code currently reloads the extension whenever the primary (first) workspace folder is added or removed.
-            // So the following handling of changes to defaultClient are likely unnecessary, unless the behavior of
-            // VS Code changes. The handling of changes to activeClient are still needed.
-
-            if (oldDefaultClient) {
-                const uri: vscode.Uri | undefined = oldDefaultClient.RootUri;
-                // uri will be set.
-                if (uri) {
-                    // Check if there is now another more appropriate client to use.
-                    this.defaultClient = this.getClientFor(uri);
-                    needNewDefaultClient = this.defaultClient === oldDefaultClient;
-                }
-                oldDefaultClient.dispose();
-            } else {
-                const defaultDefaultClient: cpptools.Client | undefined = this.languageClients.get(defaultClientKey);
-                if (defaultDefaultClient) {
-                    // If there is an entry in languageClients for defaultClientKey, we were not previously tracking any workspace folders.
-                    this.languageClients.delete(defaultClientKey);
-                    needNewDefaultClient = true;
-                    if (this.activeClient === this.defaultClient) {
-                        // Redundant deactivation should be OK.
-                        this.activeClient.deactivate();
-                    }
-                }
-            }
-
-            if (needNewDefaultClient) {
-                // Use the first workspaceFolder, if any.
-                if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
-                    const key: string = util.asFolder(vscode.workspace.workspaceFolders[0].uri);
-                    const client: cpptools.Client | undefined = this.languageClients.get(key);
+            if (e.added.length > 0) {
+                // Send a new set of settings. This will ensure the settings are
+                // read for new workspace folders. Send them up before creating new
+                // clients, so the native process is already aware of all workspace
+                // folders before receiving new CppProperties for new folders.
+                this.defaultClient.sendDidChangeSettings();
+                e.added.forEach(folder => {
+                    const path: string = util.asFolder(folder.uri);
+                    const client: cpptools.Client | undefined = this.languageClients.get(path);
                     if (!client) {
-                        // This should not occur.  If there is a workspace folder, we should have a client for it by now.
-                        throw new Error("Failed to construct default client");
+                        this.createClient(folder, true);
                     }
-                    this.defaultClient = client;
-                } else {
-                    // The user removed the last workspace folder. Create a new default defaultClient/activeClient
-                    // using the same approach as used in the constructor.
-                    this.defaultClient = cpptools.createClient(this);
-                    this.languageClients.set(defaultClientKey, this.defaultClient);
-                    this.defaultClient.deactivate();
-                    if (this.activeDocument) {
-                        // Only change activeClient if it would not be changed by the later check.
-                        this.activeClient.deactivate();
-                        this.activeClient = this.defaultClient;
-                    }
-                }
+                });
             }
+
+            // From https://code.visualstudio.com/api/references/vscode-api
+            //
+            //      Note: this event will not fire if the first workspace folder is added, removed or changed,
+            //      because in that case the currently executing extensions (including the one that listens to
+            //      this event) will be terminated and restarted so that the (deprecated) rootPath property is
+            //      updated to point to the first workspace folder.
 
             // Ensure the best client for the currently active document is activated.
             if (this.activeDocument) {
@@ -241,7 +203,7 @@ export class ClientCollection {
                     // Redundant deactivate should be OK.
                     this.activeClient.deactivate();
                     this.activeClient = newActiveClient;
-                    await this.activeClient.activeDocumentChanged(this.activeDocument);
+                    this.activeClient.updateActiveDocumentTextOptions();
                     this.activeClient.activate();
                 }
             }
@@ -260,6 +222,10 @@ export class ClientCollection {
         return this.getClientForFolder(folder);
     }
 
+    public getDefaultClient(): cpptools.Client {
+        return this.defaultClient;
+    }
+
     public getClientForFolder(folder?: vscode.WorkspaceFolder): cpptools.Client {
         if (!folder) {
             return this.defaultClient;
@@ -274,19 +240,14 @@ export class ClientCollection {
     }
 
     public createClient(folder?: vscode.WorkspaceFolder, deactivated?: boolean): cpptools.Client {
-        const newClient: cpptools.Client = this.useFailsafeMode ? cpptools.createNullClient() : cpptools.createClient(this, folder);
+        const newClient: cpptools.Client = this.useFailsafeMode ? cpptools.createNullClient() : cpptools.createClient(folder);
         if (deactivated) {
             newClient.deactivate(); // e.g. prevent the current config from switching.
         }
         const key: string = folder ? util.asFolder(folder.uri) : defaultClientKey;
         this.languageClients.set(key, newClient);
-        getCustomConfigProviders().forEach(provider => newClient.onRegisterCustomConfigurationProvider(provider));
-        newClient.sendAllSettings();
+        getCustomConfigProviders().forEach(provider => void newClient.onRegisterCustomConfigurationProvider(provider));
         return newClient;
-    }
-
-    private onDidCloseTextDocument(document: vscode.TextDocument): void {
-        // Don't seem to need to do anything here since we clean up when the workspace is closed instead.
     }
 
     public dispose(): Thenable<void> {

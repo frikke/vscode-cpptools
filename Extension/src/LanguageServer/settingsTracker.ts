@@ -14,7 +14,6 @@ type FilterFunction = (key: string, val: string, settings: vscode.WorkspaceConfi
 type KeyValuePair = { key: string; value: string };
 
 const maxSettingLengthForTelemetry: number = 50;
-let cache: SettingsTracker;
 
 export class SettingsTracker {
     private previousCppSettings: { [key: string]: any } = {};
@@ -42,7 +41,7 @@ export class SettingsTracker {
             (!rawSetting || rawSetting.scope === "resource" || rawSetting.scope === "machine-overridable") ? settingsResourceScope : settingsNonScoped;
         const result: { [key: string]: string } = {};
         for (const key in settingsResourceScope) {
-            const rawSetting: any = util.packageJson.contributes.configuration.properties["C_Cpp." + key];
+            const rawSetting: any = util.getRawSetting("C_Cpp." + key);
             const correctlyScopedSettings: vscode.WorkspaceConfiguration = selectCorrectlyScopedSettings(rawSetting);
             const val: any = this.getSetting(correctlyScopedSettings, key);
             if (val === undefined) {
@@ -50,30 +49,30 @@ export class SettingsTracker {
             }
 
             // Iterate through dotted "sub" settings.
-            const collectSettingsRecursive = (key: string, val: Object, depth: number) => {
+            const collectSettingsRecursive = (key: string, val: Record<string, any>, depth: number) => {
                 if (depth > 4) {
                     // Limit settings recursion to 4 dots (not counting the first one in: `C_Cpp.`)
                     return;
                 }
                 for (const subKey in val) {
                     const newKey: string = key + "." + subKey;
-                    const newRawSetting: any = util.packageJson.contributes.configuration.properties["C_Cpp." + newKey];
+                    const newRawSetting: any = util.getRawSetting("C_Cpp." + newKey);
                     const correctlyScopedSubSettings: vscode.WorkspaceConfiguration = selectCorrectlyScopedSettings(newRawSetting);
                     const subVal: any = this.getSetting(correctlyScopedSubSettings, newKey);
                     if (subVal === undefined) {
                         continue;
                     }
-                    if (subVal instanceof Object && !(subVal instanceof Array)) {
+                    if (newRawSetting === undefined && subVal instanceof Object) {
                         collectSettingsRecursive(newKey, subVal, depth + 1);
                     } else {
                         const entry: KeyValuePair | undefined = this.filterAndSanitize(newKey, subVal, correctlyScopedSubSettings, filter);
-                        if (entry && entry.key && entry.value) {
+                        if (entry?.key && entry.value !== undefined) {
                             result[entry.key] = entry.value;
                         }
                     }
                 }
             };
-            if (val instanceof Object && !(val instanceof Array)) {
+            if (rawSetting === undefined && val instanceof Object) {
                 collectSettingsRecursive(key, val, 1);
                 continue;
             }
@@ -96,7 +95,7 @@ export class SettingsTracker {
             }
 
             // Only return values that match the setting's type and enum (if applicable).
-            const curSetting: any = util.packageJson.contributes.configuration.properties["C_Cpp." + key];
+            const curSetting: any = util.getRawSetting("C_Cpp." + key);
             if (curSetting) {
                 const type: string | undefined = this.typeMatch(val, curSetting["type"]);
                 if (type) {
@@ -104,9 +103,18 @@ export class SettingsTracker {
                         return val;
                     }
                     const curEnum: any[] = curSetting["enum"];
-                    if (curEnum && curEnum.indexOf(val) === -1) {
+                    if (curEnum && curEnum.indexOf(val) === -1
+                        && (key !== "loggingLevel" || util.getNumericLoggingLevel(val) === -1)) {
                         return "<invalid>";
                     }
+                    return val;
+                } else if (curSetting["oneOf"]) {
+                    // Currently only C_Cpp.default.compileCommands uses this case.
+                    if (curSetting["oneOf"].some((x: any) => this.typeMatch(val, x.type))) {
+                        return val;
+                    }
+                } else if (val === curSetting["default"]) {
+                    // C_Cpp.default.browse.path is a special case where the default value is null and doesn't match the type definition.
                     return val;
                 }
             }
@@ -123,6 +131,9 @@ export class SettingsTracker {
                         if (typeof value === t) {
                             return t;
                         }
+                        if (t === "integer" && typeof value === "number") {
+                            return "number";
+                        }
                         if (t === "array" && value instanceof Array) {
                             return t;
                         }
@@ -131,8 +142,13 @@ export class SettingsTracker {
                         }
                     }
                 }
-            } else if (typeof type === "string" && typeof value === type) {
-                return type;
+            } else if (typeof type === "string") {
+                if (typeof value === type) {
+                    return type;
+                }
+                if (type === "integer" && typeof value === "number") {
+                    return "number";
+                }
             }
         }
         return undefined;
@@ -195,7 +211,7 @@ export class SettingsTracker {
             if (value && value.length > maxSettingLengthForTelemetry) {
                 value = value.substring(0, maxSettingLengthForTelemetry) + "...";
             }
-            return {key: key, value: value};
+            return { key: key, value: value };
         }
         return undefined;
     }
@@ -206,11 +222,4 @@ export class SettingsTracker {
         }
         return value1 === value2;
     }
-}
-
-export function getTracker(resource: vscode.Uri | undefined): SettingsTracker {
-    if (!cache) {
-        cache = new SettingsTracker(resource);
-    }
-    return cache;
 }

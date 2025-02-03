@@ -4,13 +4,21 @@
  * ------------------------------------------------------------------------------------------ */
 'use strict';
 
-import * as path from 'path';
 import * as fs from 'fs';
+import * as path from 'path';
 import * as vscode from 'vscode';
+import * as nls from 'vscode-nls';
 import * as util from '../common';
-import * as config from './configurations';
 import * as telemetry from '../telemetry';
+import * as config from './configurations';
 import { getLocalizedHtmlPath } from './localization';
+
+nls.config({ messageFormat: nls.MessageFormat.bundle, bundleFormat: nls.BundleFormat.standalone })();
+const localize: nls.LocalizeFunc = nls.loadMessageBundle();
+
+function deepCopy(obj: any) {
+    return JSON.parse(JSON.stringify(obj));
+}
 
 // TODO: share ElementId between SettingsPanel and SettingsApp. Investigate why SettingsApp cannot import/export
 const elementId: { [key: string]: string } = {
@@ -74,7 +82,7 @@ export class SettingsPanel {
     private panel?: vscode.WebviewPanel;
     private disposablesPanel?: vscode.Disposable;
     private static readonly viewType: string = 'settingsPanel';
-    private static readonly title: string = 'C/C++ Configurations';
+    private static readonly title: string = localize("c.cpp.configurations", 'C/C++ Configurations');
 
     // Used to workaround a VS Code 1.56 regression in which webViewPanel.onDidChangeViewState
     // gets called before the SettingsApp constructor is finished running.
@@ -115,7 +123,7 @@ export class SettingsPanel {
                 localResourceRoots: [
                     vscode.Uri.file(util.extensionPath),
                     vscode.Uri.file(path.join(util.extensionPath, 'ui')),
-                    vscode.Uri.file(path.join(util.extensionPath, 'out', 'ui'))]
+                    vscode.Uri.file(path.join(util.extensionPath, 'dist', 'ui'))]
             }
         );
 
@@ -188,7 +196,7 @@ export class SettingsPanel {
 
     public updateErrors(errors: config.ConfigurationErrors): void {
         if (this.panel) {
-            this.panel.webview.postMessage({ command: 'updateErrors', errors: errors});
+            void this.panel.webview.postMessage({ command: 'updateErrors', errors: errors });
         }
     }
 
@@ -220,14 +228,14 @@ export class SettingsPanel {
     }
 
     private updateWebview(configSelection: string[], configuration: config.Configuration, errors: config.ConfigurationErrors | null): void {
-        this.configValues = {...configuration}; // Copy configuration values
-        this.isIntelliSenseModeDefined = (this.configValues.intelliSenseMode !== undefined);
+        this.configValues = deepCopy(configuration); // Copy configuration values
+        this.isIntelliSenseModeDefined = this.configValues.intelliSenseMode !== undefined;
         if (this.panel && this.initialized) {
-            this.panel.webview.postMessage({ command: 'setKnownCompilers', compilers: this.compilerPaths });
-            this.panel.webview.postMessage({ command: 'updateConfigSelection', selections: configSelection, selectedIndex: this.configIndexSelected });
-            this.panel.webview.postMessage({ command: 'updateConfig', config: this.configValues });
+            void this.panel.webview.postMessage({ command: 'setKnownCompilers', compilers: this.compilerPaths });
+            void this.panel.webview.postMessage({ command: 'updateConfigSelection', selections: configSelection, selectedIndex: this.configIndexSelected });
+            void this.panel.webview.postMessage({ command: 'updateConfig', config: this.configValues });
             if (errors !== null) {
-                this.panel.webview.postMessage({ command: 'updateErrors', errors: errors });
+                void this.panel.webview.postMessage({ command: 'updateErrors', errors: errors });
             }
         }
     }
@@ -288,14 +296,17 @@ export class SettingsPanel {
     }
 
     private updateConfig(message: any): void {
-        const splitEntries: (input: any) => string[] = (input: any) => input.split("\n").filter((e: string) => e);
+        const splitEntries: (input: any) => string[] | undefined = (input: any) => {
+            const result = input.split("\n").filter((e: string) => e);
+            return result.length === 0 ? undefined : result;
+        };
 
         switch (message.key) {
             case elementId.configName:
                 this.configValues.name = message.value;
                 break;
             case elementId.compilerPath:
-                this.configValues.compilerPath = message.value;
+                this.configValues.compilerPath = message.value || undefined;
                 break;
             case elementId.compilerArgs:
                 this.configValues.compilerArgs = splitEntries(message.value);
@@ -320,22 +331,22 @@ export class SettingsPanel {
                 this.configValues.cppStandard = message.value;
                 break;
             case elementId.windowsSdkVersion:
-                this.configValues.windowsSdkVersion = message.value;
+                this.configValues.windowsSdkVersion = message.value || undefined;
                 break;
             case elementId.macFrameworkPath:
                 this.configValues.macFrameworkPath = splitEntries(message.value);
                 break;
             case elementId.compileCommands:
-                this.configValues.compileCommands = message.value;
+                this.configValues.compileCommands = splitEntries(message.value);
                 break;
             case elementId.dotConfig:
-                this.configValues.dotConfig = message.value;
+                this.configValues.dotConfig = message.value || undefined;
                 break;
             case elementId.mergeConfigurations:
                 this.configValues.mergeConfigurations = message.value;
                 break;
             case elementId.configurationProvider:
-                this.configValues.configurationProvider = message.value;
+                this.configValues.configurationProvider = message.value || undefined;
                 break;
             case elementId.forcedInclude:
                 this.configValues.forcedInclude = splitEntries(message.value);
@@ -356,7 +367,7 @@ export class SettingsPanel {
                 if (!this.configValues.browse) {
                     this.configValues.browse = {};
                 }
-                this.configValues.browse.databaseFilename = message.value;
+                this.configValues.browse.databaseFilename = message.value || undefined;
                 break;
         }
 
@@ -381,7 +392,7 @@ export class SettingsPanel {
             content = content.replace(
                 /{{cpp_image_uri}}/g,
                 cppImageUri.toString());
-            const settingsJsUri: vscode.Uri = this.panel.webview.asWebviewUri(vscode.Uri.file(path.join(util.extensionPath, 'out/ui/settings.js')));
+            const settingsJsUri: vscode.Uri = this.panel.webview.asWebviewUri(vscode.Uri.file(path.join(util.extensionPath, 'dist/ui/settings.js')));
             content = content.replace(
                 /{{settings_js_uri}}/g,
                 settingsJsUri.toString());

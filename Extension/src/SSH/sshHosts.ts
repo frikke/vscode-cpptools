@@ -4,23 +4,23 @@
  * ------------------------------------------------------------------------------------------ */
 
 import { promises as fs } from 'fs';
+import * as glob from 'glob';
 import * as os from 'os';
 import * as path from 'path';
 import {
-    Configuration,
-    parse,
-    ResolvedConfiguration,
-    Type as ConfigurationEntryType,
-    ConfigurationDirective,
+    Configuration, ConfigurationDirective,
     ConfigurationEntry,
-    HostConfigurationDirective
+    Type as ConfigurationEntryType,
+    HostConfigurationDirective,
+    ResolvedConfiguration,
+    parse
 } from 'ssh-config';
 import { promisify } from 'util';
-import { ISshConfigHostInfo, ISshHostInfo, isWindows, resolveHome } from "../common";
-import { getOutputChannelLogger } from '../logger';
-import * as glob from 'glob';
 import * as vscode from 'vscode';
 import * as nls from 'vscode-nls';
+import { ISshConfigHostInfo, resolveHome } from "../common";
+import { isWindows } from '../constants';
+import { getSshChannel } from '../logger';
 
 nls.config({ messageFormat: nls.MessageFormat.bundle, bundleFormat: nls.BundleFormat.standalone })();
 const localize: nls.LocalizeFunc = nls.loadMessageBundle();
@@ -30,7 +30,12 @@ const globAsync: (pattern: string, options?: glob.IOptions | undefined) => Promi
 const userSshConfigurationFile: string = path.resolve(os.homedir(), '.ssh/config');
 
 const ProgramData: string = process.env.ALLUSERSPROFILE || process.env.PROGRAMDATA || 'C:\\ProgramData';
-const systemSshConfigurationFile: string = isWindows() ? `${ProgramData}\\ssh\\ssh_config` : '/etc/ssh/ssh_config';
+const systemSshConfigurationFile: string = isWindows ? `${ProgramData}\\ssh\\ssh_config` : '/etc/ssh/ssh_config';
+
+// Stores if the SSH config files are parsed successfully.
+// Only store root config files' failure status since included files are not modified by our extension.
+// path => successful
+export const parseFailures: Map<string, boolean> = new Map<string, boolean>();
 
 export function getSshConfigurationFiles(): string[] {
     return [userSshConfigurationFile, systemSshConfigurationFile];
@@ -43,7 +48,7 @@ export async function getSshConfigHostInfos(): Promise<Map<string, ISshConfigHos
     for (const configPath of getSshConfigurationFiles()) {
         const config: Configuration = await getSshConfiguration(configPath);
         const hosts: { [host: string]: string } = extractHostNames(config);
-        Object.keys(hosts).forEach(name => (hostInfos.set(name, { hostName: hosts[name], file: configPath })));
+        Object.keys(hosts).forEach(name => hostInfos.set(name, { hostName: hosts[name], file: configPath }));
     }
 
     return hostInfos;
@@ -53,8 +58,14 @@ function extractHostNames(parsedConfig: Configuration): { [host: string]: string
     const hostNames: { [host: string]: string } = Object.create(null);
 
     extractHosts(parsedConfig).forEach(host => {
-        const resolvedConfig: ResolvedConfiguration = parsedConfig.compute(host);
-        if (resolvedConfig.HostName) {
+        let resolvedConfig: ResolvedConfiguration | undefined;
+        try {
+            resolvedConfig = parsedConfig.compute(host);
+        } catch (e) {
+            getSshChannel().appendLine(localize("failed.to.find.user.info.for.SSH",
+                "Failed to find user info for SSH. This could be caused by VS Code being installed using 'snap'. Please reinstall VS Code using the 'deb' package if you are planning to use SSH features."));
+        }
+        if (resolvedConfig?.HostName !== undefined) {
             hostNames[host] = resolvedConfig.HostName;
         } else {
             hostNames[host] = host;
@@ -64,33 +75,6 @@ function extractHostNames(parsedConfig: Configuration): { [host: string]: string
     return hostNames;
 }
 
-export async function getConfigurationForHost(host: ISshHostInfo): Promise<ResolvedConfiguration | null> {
-    return getConfigurationForHostImpl(host, getSshConfigurationFiles());
-}
-
-export async function getConfigurationForHostImpl(
-    host: ISshHostInfo,
-    configPaths: string[]
-): Promise<ResolvedConfiguration | null> {
-    for (const configPath of configPaths) {
-        const configuration: Configuration = await getSshConfiguration(configPath);
-        const config: ResolvedConfiguration = configuration.compute(host.hostName);
-
-        if (!config || !config.HostName) {
-            // No real matching config was found
-            continue;
-        }
-
-        if (config.IdentityFile) {
-            config.IdentityFile = config.IdentityFile.map(resolveHome);
-        }
-
-        return config;
-    }
-
-    return null;
-}
-
 /**
  * Gets parsed SSH configuration from file. Resolves Include directives as well unless specified otherwise.
  * @param configurationPath the location of the config file
@@ -98,8 +82,17 @@ export async function getConfigurationForHostImpl(
  * @returns
  */
 export async function getSshConfiguration(configurationPath: string, resolveIncludes: boolean = true): Promise<Configuration> {
+    parseFailures.set(configurationPath, false);
     const src: string = await getSshConfigSource(configurationPath);
-    const config: Configuration = caseNormalizeConfigProps(parse(src));
+    let parsedSrc: Configuration | undefined;
+    try {
+        parsedSrc = parse(src);
+    } catch (err) {
+        parseFailures.set(configurationPath, true);
+        getSshChannel().appendLine(localize("failed.to.parse.SSH.config", "Failed to parse SSH configuration file {0}: {1}", configurationPath, (err as Error).message));
+        return parse('');
+    }
+    const config: Configuration = caseNormalizeConfigProps(parsedSrc);
     if (resolveIncludes) {
         await resolveConfigIncludes(config, configurationPath);
     }
@@ -110,7 +103,7 @@ async function resolveConfigIncludes(config: Configuration, configPath: string):
     for (const entry of config) {
         if (isDirective(entry) && entry.param === 'Include') {
             let includePath: string = resolveHome(entry.value);
-            if (isWindows() && !!includePath.match(/^\/[a-z]:/i)) {
+            if (isWindows && !!includePath.match(/^\/[a-z]:/i)) {
                 includePath = includePath.substr(1);
             }
 
@@ -128,13 +121,22 @@ async function resolveConfigIncludes(config: Configuration, configPath: string):
 }
 
 async function getIncludedConfigFile(config: Configuration, includePath: string): Promise<void> {
+    let includedContents: string;
     try {
-        const includedContents: string = (await fs.readFile(includePath)).toString();
-        const parsed: Configuration = parse(includedContents);
-        config.push(...parsed);
+        includedContents = (await fs.readFile(includePath)).toString();
     } catch (e) {
-        getOutputChannelLogger().appendLine(localize("failed.to.read.file", "Failed to read file {0}.", includePath));
+        getSshChannel().appendLine(localize("failed.to.read.file", "Failed to read file {0}.", includePath));
+        return;
     }
+
+    let parsedIncludedContents: Configuration | undefined;
+    try {
+        parsedIncludedContents = parse(includedContents);
+    } catch (err) {
+        getSshChannel().appendLine(localize("failed.to.parse.SSH.config", "Failed to parse SSH configuration file {0}: {1}", includePath, (err as Error).message));
+        return;
+    }
+    config.push(...parsedIncludedContents);
 }
 
 export async function writeSshConfiguration(configurationPath: string, configuration: Configuration): Promise<void> {
@@ -143,7 +145,7 @@ export async function writeSshConfiguration(configurationPath: string, configura
         await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(configurationPath)));
         await fs.writeFile(configurationPath, configuration.toString());
     } catch (e) {
-        getOutputChannelLogger().appendLine(localize("failed.to.write.file", "Failed to write to file {0}.", configurationPath));
+        getSshChannel().appendLine(localize("failed.to.write.file", "Failed to write to file {0}.", configurationPath));
     }
 }
 
@@ -153,7 +155,11 @@ async function getSshConfigSource(configurationPath: string): Promise<string> {
         const buffer: Buffer = await fs.readFile(configurationPath);
         return buffer.toString('utf8');
     } catch (e) {
-        getOutputChannelLogger().appendLine(localize("failed.to.read.file", "Failed to read file {0}.", configurationPath));
+        parseFailures.set(configurationPath, true);
+        if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
+            return '';
+        }
+        getSshChannel().appendLine(localize("failed.to.read.file", "Failed to read file {0}.", configurationPath));
     }
 
     return '';

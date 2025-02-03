@@ -4,10 +4,11 @@
  * ------------------------------------------------------------------------------------------ */
 'use strict';
 
-import * as vscode from 'vscode';
 import * as os from 'os';
-import { CppSourceStr } from './LanguageServer/extension';
+import * as vscode from 'vscode';
 import * as nls from 'vscode-nls';
+import { getNumericLoggingLevel } from './common';
+import { CppSourceStr } from './LanguageServer/extension';
 import { getLocalizedString, LocalizeStringParams } from './LanguageServer/localization';
 
 nls.config({ messageFormat: nls.MessageFormat.bundle, bundleFormat: nls.BundleFormat.standalone })();
@@ -73,8 +74,10 @@ export class Logger {
 
 export let outputChannel: vscode.OutputChannel | undefined;
 export let diagnosticsChannel: vscode.OutputChannel | undefined;
+export let crashCallStacksChannel: vscode.OutputChannel | undefined;
 export let debugChannel: vscode.OutputChannel | undefined;
 export let warningChannel: vscode.OutputChannel | undefined;
+export let sshChannel: vscode.OutputChannel | undefined;
 
 export function getOutputChannel(): vscode.OutputChannel {
     if (!outputChannel) {
@@ -82,7 +85,7 @@ export function getOutputChannel(): vscode.OutputChannel {
         // Do not use CppSettings to avoid circular require()
         const settings: vscode.WorkspaceConfiguration = vscode.workspace.getConfiguration("C_Cpp", null);
         const loggingLevel: string | undefined = settings.get<string>("loggingLevel");
-        if (!!loggingLevel && loggingLevel !== "None" && loggingLevel !== "Error") {
+        if (getNumericLoggingLevel(loggingLevel) > 1) {
             outputChannel.appendLine(`loggingLevel: ${loggingLevel}`);
         }
     }
@@ -94,6 +97,23 @@ export function getDiagnosticsChannel(): vscode.OutputChannel {
         diagnosticsChannel = vscode.window.createOutputChannel(localize("c.cpp.diagnostics", "C/C++ Diagnostics"));
     }
     return diagnosticsChannel;
+}
+
+export function getCrashCallStacksChannel(): vscode.OutputChannel {
+    if (!crashCallStacksChannel) {
+        crashCallStacksChannel = vscode.window.createOutputChannel(localize("c.cpp.crash.call.stacks.title", "C/C++ Crash Call Stacks"));
+        crashCallStacksChannel.appendLine(localize({ key: "c.cpp.crash.call.stacks.description", comment: ["{0} is a URL."] },
+            "A C/C++ extension process has crashed. The crashing process name, date/time, signal, and call stack are below -- it would be helpful to include that in a bug report at {0}.",
+            "https://github.com/Microsoft/vscode-cpptools/issues"));
+    }
+    return crashCallStacksChannel;
+}
+
+export function getSshChannel(): vscode.OutputChannel {
+    if (!sshChannel) {
+        sshChannel = vscode.window.createOutputChannel(localize("c.cpp.ssh.channel", "{0}: SSH", "Cpptools"));
+    }
+    return sshChannel;
 }
 
 export function showOutputChannel(): void {

@@ -3,30 +3,30 @@
  * See 'LICENSE' in the project root for license information.
  * ------------------------------------------------------------------------------------------ */
 
-import { PsProcessParser } from './nativeAttach';
-import { AttachItem, showQuickPick } from './attachQuickPick';
 import { CppSettings } from '../LanguageServer/settings';
+import { AttachItem, showQuickPick } from './attachQuickPick';
+import { PsProcessParser } from './nativeAttach';
 
-import * as debugUtils from './utils';
 import * as os from 'os';
 import * as path from 'path';
-import * as util from '../common';
 import * as vscode from 'vscode';
 import * as nls from 'vscode-nls';
+import * as util from '../common';
+import * as debugUtils from './utils';
 
 nls.config({ messageFormat: nls.MessageFormat.bundle, bundleFormat: nls.BundleFormat.standalone })();
 const localize: nls.LocalizeFunc = nls.loadMessageBundle();
 
 export interface AttachItemsProvider {
-    getAttachItems(): Promise<AttachItem[]>;
+    getAttachItems(token?: vscode.CancellationToken): Promise<AttachItem[]>;
 }
 
 export class AttachPicker {
     constructor(private attachItemsProvider: AttachItemsProvider) { }
 
     // We should not await on this function.
-    public async ShowAttachEntries(): Promise<string | undefined> {
-        return showQuickPick(() => this.attachItemsProvider.getAttachItems());
+    public async ShowAttachEntries(token?: vscode.CancellationToken): Promise<string | undefined> {
+        return showQuickPick(() => this.attachItemsProvider.getAttachItems(token));
     }
 }
 
@@ -112,6 +112,7 @@ export class RemoteAttachPicker {
         let parameterBegin: string = `$(`;
         let parameterEnd: string = `)`;
         let escapedQuote: string = `\\\"`;
+        let shPrefix: string = ``;
 
         const settings: CppSettings = new CppSettings();
         if (settings.useBacktickCommandSubstitution) {
@@ -126,8 +127,13 @@ export class RemoteAttachPicker {
             innerQuote = `"`;
             outerQuote = `'`;
         }
+        // Also use a full path on Linux, so that we can use transports that need a full path such as 'machinectl' to connect to nspawn containers.
+        if (os.platform() === "linux") {
+            shPrefix = `/bin/`;
+        }
 
-        return `${outerQuote}sh -c ${innerQuote}uname && if [ ${parameterBegin}uname${parameterEnd} = ${escapedQuote}Linux${escapedQuote} ] ; ` +
+        return `${outerQuote}${shPrefix}sh -c ${innerQuote}uname && if [ ${parameterBegin}uname -o${parameterEnd} = ${escapedQuote}Toybox${escapedQuote} ] ; ` +
+            `then ${PsProcessParser.psToyboxCommand} ; elif [ ${parameterBegin}uname${parameterEnd} = ${escapedQuote}Linux${escapedQuote} ] ; ` +
             `then ${PsProcessParser.psLinuxCommand} ; elif [ ${parameterBegin}uname${parameterEnd} = ${escapedQuote}Darwin${escapedQuote} ] ; ` +
             `then ${PsProcessParser.psDarwinCommand}; fi${innerQuote}${outerQuote}`;
     }
@@ -181,13 +187,18 @@ export class RemoteAttachPicker {
         const args: string[] = [`-ex "target extended-remote ${miDebuggerServerAddress}"`, '-ex "info os processes"', '-batch'];
         let processListOutput: util.ProcessReturnType = await util.spawnChildProcess(miDebuggerPath, args);
         // The device may not be responsive for a while during the restart after image deploy. Retry 5 times.
-        for (let i: number = 0; i < 5 && !processListOutput.succeeded; i++) {
+        for (let i: number = 0; i < 5 && !processListOutput.succeeded && processListOutput.outputError.length === 0; i++) {
             processListOutput = await util.spawnChildProcess(miDebuggerPath, args);
         }
 
         if (!processListOutput.succeeded) {
             throw new Error(localize('failed.to.make.gdb.connection', 'Failed to make GDB connection: "{0}".', processListOutput.output));
         }
+
+        if (processListOutput.outputError.length !== 0) {
+            throw new Error(localize('failed.to.make.gdb.connection', 'Failed to make GDB connection: "{0}".', processListOutput.outputError));
+        }
+
         const processes: AttachItem[] = this.parseProcessesFromInfoOsProcesses(processListOutput.output);
         if (!processes || processes.length === 0) {
             throw new Error(localize('failed.to.parse.processes', 'Failed to parse processes: "{0}".', processListOutput.output));
@@ -200,7 +211,7 @@ export class RemoteAttachPicker {
     pid      usr      command     cores
     1        ?
     2        ?
-    3                 /usr/bin/sample 0
+    3                 /usr/bin/sample 0,2
     4        root     /usr/bin/gdbserver --multi :6000 0
 
     Returns an AttachItem array, each item contains a label of "<user   >command", and a pid.
@@ -217,7 +228,7 @@ export class RemoteAttachPicker {
         for (const line of lines) {
             const trimmedLine: string = line.trim();
             if (!trimmedLine.endsWith('?')) {
-                const matches: RegExpMatchArray | null = trimmedLine.match(/^(\d+)\s+(.+?)\s+\d+$/);
+                const matches: RegExpMatchArray | null = trimmedLine.match(/^(\d+)\s+(.+?)\s+(?:\d+,)*\d+$/);
                 if (matches?.length === 3) {
                     const id: string = matches[1];
                     const userCommand: string = matches[2];

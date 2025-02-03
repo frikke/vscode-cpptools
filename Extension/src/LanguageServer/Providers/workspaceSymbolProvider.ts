@@ -3,9 +3,11 @@
  * See 'LICENSE' in the project root for license information.
  * ------------------------------------------------------------------------------------------ */
 import * as vscode from 'vscode';
-import { DefaultClient, GetSymbolInfoRequest, WorkspaceSymbolParams, LocalizeSymbolInformation, SymbolScope } from '../client';
-import { makeVscodeLocation } from '../utils';
+import { ResponseError } from 'vscode-languageclient';
+import { DefaultClient, GetSymbolInfoRequest, LocalizeSymbolInformation, SymbolScope, WorkspaceSymbolParams } from '../client';
 import { getLocalizedString, getLocalizedSymbolScope } from '../localization';
+import { RequestCancelled, ServerCancelled } from '../protocolFilter';
+import { makeVscodeLocation } from '../utils';
 
 export class WorkspaceSymbolProvider implements vscode.WorkspaceSymbolProvider {
     private client: DefaultClient;
@@ -14,12 +16,28 @@ export class WorkspaceSymbolProvider implements vscode.WorkspaceSymbolProvider {
     }
 
     public async provideWorkspaceSymbols(query: string, token: vscode.CancellationToken): Promise<vscode.SymbolInformation[]> {
+        // if the query is empty, then return as quickly as possible
+        if (!query) {
+            return [];
+        }
+
         const params: WorkspaceSymbolParams = {
             query: query
         };
 
-        const symbols: LocalizeSymbolInformation[] = await this.client.languageClient.sendRequest(GetSymbolInfoRequest, params, token);
+        let symbols: LocalizeSymbolInformation[];
+        try {
+            symbols = await this.client.languageClient.sendRequest(GetSymbolInfoRequest, params, token);
+        } catch (e: any) {
+            if (e instanceof ResponseError && (e.code === RequestCancelled || e.code === ServerCancelled)) {
+                throw new vscode.CancellationError();
+            }
+            throw e;
+        }
         const resultSymbols: vscode.SymbolInformation[] = [];
+        if (token.isCancellationRequested) {
+            throw new vscode.CancellationError();
+        }
 
         // Convert to vscode.Command array
         symbols.forEach((symbol) => {

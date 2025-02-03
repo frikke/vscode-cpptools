@@ -3,8 +3,11 @@
  * See 'LICENSE' in the project root for license information.
  * ------------------------------------------------------------------------------------------ */
 import * as vscode from 'vscode';
-import { DefaultClient, FormatParams, FormatDocumentRequest } from '../client';
-import { CppSettings, getEditorConfigSettings, OtherSettings } from '../settings';
+import { ResponseError } from 'vscode-languageclient';
+import { DefaultClient, FormatDocumentRequest, FormatParams, FormatResult } from '../client';
+import { getEditorConfigSettings } from '../editorConfig';
+import { RequestCancelled, ServerCancelled } from '../protocolFilter';
+import { CppSettings, OtherSettings } from '../settings';
 import { makeVscodeTextEdits } from '../utils';
 
 export class DocumentFormattingEditProvider implements vscode.DocumentFormattingEditProvider {
@@ -14,13 +17,18 @@ export class DocumentFormattingEditProvider implements vscode.DocumentFormatting
     }
 
     public async provideDocumentFormattingEdits(document: vscode.TextDocument, options: vscode.FormattingOptions, token: vscode.CancellationToken): Promise<vscode.TextEdit[]> {
-        await this.client.awaitUntilLanguageClientReady();
+        const settings: CppSettings = new CppSettings(vscode.workspace.getWorkspaceFolder(document.uri)?.uri);
+        if (settings.formattingEngine === "disabled") {
+            return [];
+        }
+        await this.client.ready;
         const filePath: string = document.uri.fsPath;
-        const onChanges: string | number | boolean = options.onChanges;
-        if (onChanges) {
+        if (options.onChanges) {
             let insertSpacesSet: boolean = false;
             let tabSizeSet: boolean = false;
-            const editor: vscode.TextEditor = await vscode.window.showTextDocument(document, undefined, true);
+            // Even when preserveFocus is true, VS Code is making the document active (when we don't want that).
+            // The workaround is for the code invoking the formatting to call showTextDocument again afterwards on the previously active document.
+            const editor: vscode.TextEditor = await vscode.window.showTextDocument(document, { preserveFocus: options.preserveFocus as boolean });
             if (editor.options.insertSpaces && typeof editor.options.insertSpaces === "boolean") {
                 options.insertSpaces = editor.options.insertSpaces;
                 insertSpacesSet = true;
@@ -31,7 +39,7 @@ export class DocumentFormattingEditProvider implements vscode.DocumentFormatting
             }
 
             if (!insertSpacesSet || !tabSizeSet) {
-                const settings: OtherSettings = new OtherSettings(this.client.RootUri);
+                const settings: OtherSettings = new OtherSettings(vscode.workspace.getWorkspaceFolder(document.uri)?.uri);
                 if (!insertSpacesSet) {
                     options.insertSpaces = settings.editorInsertSpaces ?? true;
                 }
@@ -40,7 +48,6 @@ export class DocumentFormattingEditProvider implements vscode.DocumentFormatting
                 }
             }
         }
-        const settings: CppSettings = new CppSettings(this.client.RootUri);
         const useVcFormat: boolean = settings.useVcFormat(document);
         const configCallBack = async (editorConfigSettings: any | undefined) => {
             const params: FormatParams = {
@@ -60,13 +67,21 @@ export class DocumentFormattingEditProvider implements vscode.DocumentFormatting
                         line: 0
                     }
                 },
-                onChanges: onChanges === true
+                onChanges: options.onChanges === true
             };
-            // We do not currently pass the CancellationToken to sendRequest
-            // because there is not currently cancellation logic for formatting
-            // in the native process. Formatting is currently done directly in
-            // message handling thread.
-            const results: vscode.TextEdit[] = makeVscodeTextEdits(await this.client.languageClient.sendRequest(FormatDocumentRequest, params));
+            let response: FormatResult;
+            try {
+                response = await this.client.languageClient.sendRequest(FormatDocumentRequest, params, token);
+            } catch (e: any) {
+                if (e instanceof ResponseError && (e.code === RequestCancelled || e.code === ServerCancelled)) {
+                    throw new vscode.CancellationError();
+                }
+                throw e;
+            }
+            if (token.isCancellationRequested) {
+                throw new vscode.CancellationError();
+            }
+            const results: vscode.TextEdit[] = makeVscodeTextEdits(response.edits);
             // Apply insert_final_newline from .editorconfig
             if (document.lineCount > 0 && editorConfigSettings !== undefined && editorConfigSettings.insert_final_newline) {
                 // Check if there is already a newline at the end.  If so, formatting edits should not replace it.

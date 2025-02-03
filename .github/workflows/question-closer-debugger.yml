@@ -1,7 +1,7 @@
 name: Question Closer - debugger
 on:
   schedule:
-    - cron: 20 11 * * * # Run at 11:20 AM UTC (3:20 AM PST, 4:20 AM PDT)
+    - cron: 0 14 * * * # Run at 2:00 PM UTC (6:00 AM PST, 7:00 AM PDT)
   workflow_dispatch:
    inputs:
      readonly:
@@ -11,6 +11,8 @@ on:
 jobs:
   main:
     runs-on: ubuntu-latest
+    permissions:
+      issues: write
     steps:
       - name: Checkout Actions
         uses: actions/checkout@v2
@@ -21,7 +23,7 @@ jobs:
         with:
           readonly: ${{ github.event.inputs.readonly }}
           labels: question,debugger
-          ignoreLabels: language service,internal
+          ignoreLabels: Language Service,internal
           involves: wardengnaw,pieandcakes,calgagi
           closeDays: 14
           closeComment: "This issue has been closed because it is a question and has not had recent activity."
