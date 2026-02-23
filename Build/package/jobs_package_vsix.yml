@@ -63,7 +63,7 @@ jobs:
     displayName: Install NuGet
   - task: NuGetAuthenticate@1
     displayName: Authenticate NuGet
-  - script: nuget restore $(Build.SourcesDirectory)\Build\signing\SignVsix.proj -PackagesDirectory $(Build.SourcesDirectory)\Build\signing\packages
+  - script: nuget restore $(Build.SourcesDirectory)\Build\signing\SignVsix.proj -PackagesDirectory $(Build.SourcesDirectory)\Build\signing\packages -ConfigFile $(Build.SourcesDirectory)\Build\signing\NuGet.config
     displayName: Restore MicroBuild Core
   - task: MSBuild@1
     displayName: Sign the vsix
